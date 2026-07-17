@@ -1,300 +1,934 @@
-import tkinter as tk # as tk เพื่อย่อชื่อจาก tkinter เป็น tk
-from tkinter import ttk, messagebox 
-# ttk คือชุด Widget ที่มีรูปลักษณ์ทันสมัยกว่า Widget แบบเดิมของ Tkinter
-# messagebox ใช้สร้างกล่องข้อความที่เด้งขึ้นมา
+"""Compact Tkinter companion for RIGOL MSO/DS1000Z oscilloscopes."""
 
-import pyvisa # ไลบรารีที่ใช้ติดต่อกับเครื่องมือวัด เช่น RIGOL oscilloscope
+import csv
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
-# ผู้ใช้กดปุ่มใน GUI
-#        ↓
-# RigolGUI รับเหตุการณ์
-#        ↓
-# เรียก ScopeController
-#        ↓
-# PyVISA ส่งคำสั่งผ่าน USB
-#        ↓
-# RIGOL ทำงานตามคำสั่ง
+import numpy as np
+import pyvisa
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib.ticker import MultipleLocator
 
-class ScopeController:  # ติดต่อและควบคุมเครื่อง RIGOL
-    """Control the RIGOL oscilloscope through PyVISA."""
 
-    def __init__(self): #Constructor (ฟังก์ชันกำหนดค่าเริ่มต้น) ฟังก์ชันนี้จะทำงานอัตโนมัติเมื่อสร้าง Object
-        self.resource_manager = None    #ยังไม่ได้สร้างตัวจัดการอุปกรณ์
-        # ค้นหาและเปิดอุปกรณ์
-        # Resource Manager (ตัวจัดการอุปกรณ์) คือ
-        # ค้นหาอุปกรณ์เครื่องมือวัดที่ต่อกับคอมพิวเตอร์
-        # แสดงรายการอุปกรณ์ที่พบ
-        # เปิดการเชื่อมต่อกับอุปกรณ์ที่เลือก
-        # จัดการช่องทางการสื่อสารของ PyVISA
-        
-        self.scope = None   # ยังไม่ได้เชื่อมต่อกับออสซิลโลสโคป
-        # ใช้ส่งคำสั่งไปยังเครื่อง RIGOL (ใช้เก็บ การเชื่อมต่อกับ Oscilloscope (ออสซิลโลสโคป) เครื่องที่เปิดใช้งานแล้ว)
+class ScopeController:
+    """Keep all VISA and SCPI communication separate from the GUI."""
 
-    def connect(self):
-        """Connect to the first USB instrument found."""
-        if self.scope is not None:
-            raise RuntimeError("The oscilloscope is already connected.")    # ข้อผิดพลาดนี้จะถูกส่งไปยังส่วน except ใน GUI เพื่อแสดงกล่องข้อความให้ผู้ใช้เห็น
+    CHANNELS = {f"CH{number}": f"CHANnel{number}" for number in range(1, 5)}
 
-        self.resource_manager = pyvisa.ResourceManager("@py")   # "@py" หมายถึงให้ ใช้ pyvisa-py เป็น Backend (ระบบเบื้องหลัง)
-        resources = self.resource_manager.list_resources()  # คำสั่ง list_resources() ให้ PyVISA แสดงรายการเครื่องมือทั้งหมดที่ค้นพบ
-                                                            # หากยังไม่ได้ต่อเครื่อง อาจได้ ()
-                                                            # หากต่อ RIGOL แล้ว อาจได้ประมาณนี้ ("USB0::6833::1200::DSxxxx::0::INSTR",)
-
-        for resource in resources:  # ใช้วนตรวจสอบ Resource (ทรัพยากรหรืออุปกรณ์) ทีละรายการ
-            if resource.startswith("USB"):  # คำสั่ง startswith("USB") ตรวจสอบว่าข้อความเริ่มต้นด้วย USB หรือไม่
-                self.scope = self.resource_manager.open_resource(resource)  # open_resource() ใช้เปิดการเชื่อมต่อกับอุปกรณ์ที่เลือก เมื่อเชื่อมต่อสำเร็จ Object ของอุปกรณ์จะถูกเก็บไว้ใน self.scope
-                                                                            # จากนี้ Method อื่น เช่น run_scope() และ stop_scope() จึงสามารถใช้ self.scope ส่งคำสั่งได้
-                self.scope.timeout = 2000   # หากส่งคำสั่งแล้วเครื่องไม่ตอบภายใน 2 วินาที ให้ถือว่าเกิดข้อผิดพลาด
-                return resource # เมื่อเชื่อมต่อสำเร็จ ฟังก์ชันจะส่งชื่อ Resource กลับไปยัง GUI
-                                # ตัวอย่างชื่อที่ส่งกลับคือ
-                                # USB0::6833::1200::DSxxxx::0::INSTR
-                                # GUI จะนำข้อความนี้ไปแสดงในกล่อง
-
-        # Close ResourceManager if no USB instrument is found.
-        self.resource_manager.close()
+    def __init__(self, backend="@py", timeout=5000):
+        self.backend = backend
+        self.timeout = timeout
         self.resource_manager = None
+        self.scope = None
+        self.resource_name = None
+        self.instrument_id = None
 
-        raise RuntimeError("No USB instrument found.")
+    def _create_resource_manager(self):
+        if self.resource_manager is None:
+            self.resource_manager = pyvisa.ResourceManager(self.backend)
+
+    def search(self):
+        self._create_resource_manager()
+        return [
+            resource
+            for resource in self.resource_manager.list_resources()
+            if resource.upper().startswith("USB")
+        ]
+
+    def connect(self, resource_name):
+        if not resource_name:
+            raise RuntimeError("Please select a VISA device first.")
+        if self.scope is not None:
+            self.disconnect()
+
+        self._create_resource_manager()
+        try:
+            self.scope = self.resource_manager.open_resource(resource_name)
+            self.scope.timeout = self.timeout
+            # A USB-sized chunk prevents pyvisa-py from waiting for a 1 MB read.
+            self.scope.chunk_size = 1024
+            self.scope.write_termination = "\n"
+            self.scope.read_termination = "\n"
+            self.resource_name = resource_name
+            self.instrument_id = self.query("*IDN?")
+            return self.instrument_id
+        except Exception:
+            self.disconnect()
+            raise
 
     def disconnect(self):
-        """Disconnect from the oscilloscope."""
-        # 1. ปิดการเชื่อมต่อกับเครื่อง RIGOL
         if self.scope is not None:
-            self.scope.close()
-            self.scope = None
-
-        # 2. ปิด Resource Manager (ตัวจัดการอุปกรณ์)
+            try:
+                self.scope.close()
+            finally:
+                self.scope = None
         if self.resource_manager is not None:
-            self.resource_manager.close()
-            self.resource_manager = None
-        
-        
-    def run_scope(self):
-        """Start waveform acquisition."""
+            try:
+                self.resource_manager.close()
+            finally:
+                self.resource_manager = None
+        self.resource_name = None
+        self.instrument_id = None
+
+    def ensure_connected(self):
         if self.scope is None:
             raise RuntimeError("The oscilloscope is not connected.")
 
-        self.scope.write(":RUN")    # :RUN เป็น SCPI command (คำสั่งมาตรฐานสำหรับควบคุมเครื่องมือวัด) ที่ตัวเครื่องรองรับอยู่แล้ว
+    def write(self, command):
+        self.ensure_connected()
+        self.scope.write(command)
 
-    def stop_scope(self):
-        """Stop waveform acquisition."""
-        if self.scope is None:
-            raise RuntimeError("The oscilloscope is not connected.")
+    def query(self, command):
+        self.ensure_connected()
+        return self.scope.query(command).strip()
 
-        self.scope.write(":STOP")   # :STOP บอกให้ออสซิลโลสโคปหยุดรับข้อมูลรูปคลื่นใหม่
-        # write() ใช้ส่งคำสั่งไปยังเครื่อง โดยไม่ได้รอข้อความตอบกลับ
-        
-        # กดปุ่ม Stop
-        # → RigolGUI.stop_scope()
-        # → ScopeController.stop_scope()
-        # → self.scope.write(":STOP")
+    def query_float(self, command):
+        return float(self.query(command))
 
-    def is_connected(self):
-        """Return True when the oscilloscope is connected."""
-        return self.scope is not None
+    @classmethod
+    def source(cls, channel):
+        try:
+            return cls.CHANNELS[channel]
+        except KeyError as error:
+            raise ValueError(f"Invalid channel: {channel}") from error
+
+    def run(self):
+        self.write(":RUN")
+    def stop(self):
+        self.write(":STOP")
+    def single(self):
+        self.write(":SINGle")
+
+    def auto_set(self):
+        # MSO/DS1000Z uses AUToscale, not AUToset.
+        self.write(":SYSTem:AUToscale ON")
+        self.write(":AUToscale")
+
+    def trigger_status(self):
+        return self.query(":TRIGger:STATus?").upper()
+
+    def set_channel_display(self, channel, displayed):
+        state = "ON" if displayed else "OFF"
+        self.write(f":{self.source(channel)}:DISPlay {state}")
+
+    def set_channel_scale(self, channel, volts_per_div):
+        self.write(f":{self.source(channel)}:SCALe {volts_per_div}")
+
+    def get_channel_display(self, channel):
+        return bool(int(float(self.query(f":{self.source(channel)}:DISPlay?"))))
+
+    def get_channel_scale(self, channel):
+        return self.query_float(f":{self.source(channel)}:SCALe?")
+
+    def set_time_scale(self, seconds_per_div):
+        self.write(f":TIMebase:MAIN:SCALe {seconds_per_div}")
+
+    def get_time_scale(self):
+        return self.query_float(":TIMebase:MAIN:SCALe?")
+
+    def _query_binary_block(self, command, timeout=30000, minimum_size=0):
+        """Read a definite-length IEEE block reliably through pyvisa-py."""
+        self.ensure_connected()
+        old_timeout = self.scope.timeout
+        old_read_termination = self.scope.read_termination
+        try:
+            self.scope.timeout = timeout
+            self.scope.read_termination = None
+            self.scope.write(command)
+
+            prefix = bytes(self.scope.read_bytes(2, break_on_termchar=False))
+            if len(prefix) != 2 or prefix[:1] != b"#":
+                raise RuntimeError(f"Invalid binary block header: {prefix!r}")
+
+            try:
+                digit_count = int(prefix[1:2].decode("ascii"))
+            except (ValueError, UnicodeDecodeError) as error:
+                raise RuntimeError(f"Invalid binary length header: {prefix!r}") from error
+            if digit_count <= 0:
+                raise RuntimeError("Indefinite binary blocks are not supported.")
+
+            length_text = bytes(
+                self.scope.read_bytes(digit_count, break_on_termchar=False)
+            )
+            try:
+                payload_length = int(length_text.decode("ascii"))
+            except (ValueError, UnicodeDecodeError) as error:
+                raise RuntimeError(f"Invalid payload length: {length_text!r}") from error
+
+            payload = bytes(
+                self.scope.read_bytes(
+                    payload_length,
+                    chunk_size=1024,
+                    break_on_termchar=False,
+                )
+            )
+
+            # RIGOL may append CR/LF outside the advertised block length.
+            self.scope.timeout = 100
+            for _ in range(2):
+                try:
+                    trailing = bytes(
+                        self.scope.read_bytes(1, break_on_termchar=False)
+                    )
+                except Exception:
+                    break
+                if trailing not in (b"\r", b"\n"):
+                    raise RuntimeError(
+                        f"Unexpected byte after {command}: {trailing!r}"
+                    )
+
+            if len(payload) != payload_length:
+                raise RuntimeError(
+                    f"Expected {payload_length} bytes, received {len(payload)}."
+                )
+            if minimum_size and payload_length < minimum_size:
+                raise RuntimeError(
+                    f"Expected at least {minimum_size} bytes, received {payload_length}."
+                )
+            return payload
+        finally:
+            self.scope.timeout = old_timeout
+            self.scope.read_termination = old_read_termination
+
+    def acquire_waveform(self, channel):
+        source = self.source(channel)
+        self.write(f":WAVeform:SOURce {source}")
+        self.write(":WAVeform:MODE NORMal")
+        self.write(":WAVeform:FORMat BYTE")
+
+        preamble_text = self.query(":WAVeform:PREamble?")
+        preamble = [float(item) for item in preamble_text.split(",")]
+        if len(preamble) < 10:
+            raise RuntimeError(f"Invalid waveform preamble for {channel}.")
+
+        returned_points = int(preamble[2])
+        x_increment, x_origin, x_reference = preamble[4:7]
+        y_increment, y_origin, y_reference = preamble[7:10]
+        payload = self._query_binary_block(
+            ":WAVeform:DATA?", timeout=30000, minimum_size=1
+        )
+        raw = np.frombuffer(payload, dtype=np.uint8)
+        point_count = min(raw.size, returned_points)
+        if point_count < 2:
+            raise RuntimeError(f"Not enough waveform points returned from {channel}.")
+        raw = raw[:point_count].astype(float)
+        indexes = np.arange(point_count, dtype=float)
+        time_values = (indexes - x_reference) * x_increment + x_origin
+        voltage_values = (raw - y_origin - y_reference) * y_increment
+        # BYTE waveform values use code 127 as the vertical screen centre.
+        # Keep this display coordinate separate from the calibrated voltage
+        # so moving a channel with the scope's Position knob is reproduced.
+        display_values = (raw - 127.0) * y_increment
+        return {
+            "channel": channel,
+            "time": time_values,
+            "voltage": voltage_values,
+            "display_voltage": display_values,
+            "points": point_count,
+        }
+
+    def capture_screenshot(self):
+        command = ":DISPlay:DATA? ON,OFF,PNG"
+        data = self._query_binary_block(command, timeout=30000)
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise RuntimeError("The oscilloscope did not return a valid PNG image.")
+        return data
 
 
-class RigolGUI: #สร้างหน้าต่างและรับการกดปุ่ม
-    """Graphical user interface for controlling a RIGOL oscilloscope."""
+class RigolApp:
+    """Compact capture-and-export UI rather than a duplicate front panel."""
 
-    def __init__(self, root):
+    CHANNEL_COLORS = {
+        "CH1": "#f2c94c",
+        "CH2": "#22d3d6",
+        "CH3": "#ed5bb5",
+        "CH4": "#3b9cff",
+    }
+    VOLTAGE_SCALES = {
+        **{f"{n} mV/div": n / 1000 for n in (1, 2, 5, 10, 20, 50, 100, 200, 500)},
+        **{f"{n} V/div": float(n) for n in (1, 2, 5, 10)},
+    }
+    TIME_SCALES = {
+        f"{n} {unit}/div": n * factor
+        for unit, factor, values in (
+            ("ns", 1e-9, (5, 10, 20, 50, 100, 200, 500)),
+            ("us", 1e-6, (1, 2, 5, 10, 20, 50, 100, 200, 500)),
+            ("ms", 1e-3, (1, 2, 5, 10, 20, 50, 100, 200, 500)),
+            ("s", 1.0, (1, 2, 5, 10, 20, 50)),
+        )
+        for n in values
+    }
+
+    def __init__(self, root, controller=None):
         self.root = root
-        self.controller = ScopeController()
+        self.controller = controller or ScopeController()
+        self.waveform_data = {}
+        self.single_poll_count = 0
+        self.refresh_job = None
+        self.connected_widgets = []
+        self.style = ttk.Style(root)
+        for name, color in (("Run", "#159447"), ("Stop", "#c73535")):
+            self.style.configure(f"{name}.TButton", foreground=color)
+            self.style.map(
+                f"{name}.TButton",
+                foreground=[("disabled", "#888888"), ("!disabled", color)],
+            )
+        self.style.configure("Connected.TLabel", foreground="#159447")
+        self.style.configure("Disconnected.TLabel", foreground="#c73535")
+        for channel, color in self.CHANNEL_COLORS.items():
+            style_name = f"{channel}.TCheckbutton"
+            self.style.configure(style_name, foreground=color)
+            self.style.map(
+                style_name,
+                foreground=[("disabled", "#888888"), ("!disabled", color)],
+            )
 
-        self.root.title("RIGOL Oscilloscope Controller")
-        self.root.geometry("700x450")
-        self.root.minsize(650, 420)
+        self.device_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="DISCONNECTED")
+        self.command_var = tk.StringVar(value="*IDN?")
+        self.time_scale_var = tk.StringVar(value="1 ms/div")
+        self.channel_vars = {
+            channel: {
+                "display": tk.BooleanVar(value=(channel == "CH1")),
+                "scale": tk.StringVar(value="1 V/div"),
+            }
+            for channel in self.CHANNEL_COLORS
+        }
 
-        self.create_widgets()
-        self.update_connection_status(False) # ยังไม่ได้เชื่อมต่อกับออสซิลโลสโคป
+        self._configure_window()
+        self._create_widgets()
+        self._style_graph("Connect a scope, then select Update Graph")
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.search_devices(show_error=False)
 
-        self.root.protocol("WM_DELETE_WINDOW", self.close_application)
+    def _configure_window(self):
+        self.root.title("RIGOL Oscilloscope Capture Companion")
+        self.root.geometry("1200x760")
+        self.root.minsize(900, 620)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(2, weight=1)
 
-    def create_widgets(self):
-        """Create and arrange GUI widgets."""
+    def _create_widgets(self):
+        self._create_instrument_section()
+        self._create_command_section()
 
-        main_frame = ttk.Frame(self.root, padding=20)
-        main_frame.pack(fill="both", expand=True)
+        body = ttk.Frame(self.root)
+        body.grid(row=2, column=0, sticky="nsew", padx=8, pady=4)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+        controls = ttk.Frame(body, width=230)
+        controls.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        controls.grid_propagate(False)
+        self._create_scope_controls(controls)
+        self._create_channel_controls(controls)
+        self._create_horizontal_controls(controls)
+        self._create_export_controls(controls)
+        self._create_waveform_section(body)
+        self._create_log_section()
+        self._create_status_bar()
 
-        title_label = ttk.Label(
-            main_frame,
-            text="RIGOL Oscilloscope Controller",
-            font=("Arial", 18, "bold")
+    def _create_instrument_section(self):
+        frame = ttk.LabelFrame(self.root, text="1. Instrument")
+        frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text="Device:").grid(row=0, column=0, padx=5, pady=5)
+        self.device_box = ttk.Combobox(
+            frame, textvariable=self.device_var, state="readonly"
         )
-        title_label.pack(pady=(5, 20))
-
-        status_frame = ttk.LabelFrame(
-            main_frame,
-            text="Connection Status",
-            padding=15
+        self.device_box.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        buttons = (
+            ("Search", "search_button", self.search_devices, "normal"),
+            ("Connect", "connect_button", self.connect_scope, "disabled"),
+            ("Disconnect", "disconnect_button", self.disconnect_scope, "disabled"),
         )
-        status_frame.pack(fill="x", pady=(0, 15))
-
+        for column, (text, attribute, command, state) in enumerate(buttons, start=2):
+            button = ttk.Button(frame, text=text, command=command, state=state)
+            button.grid(row=0, column=column, padx=3)
+            setattr(self, attribute, button)
+        ttk.Label(frame, text="Status:").grid(row=0, column=5, padx=(12, 2))
         self.status_label = ttk.Label(
-            status_frame,
-            text="DISCONNECTED",    # ตอนสร้าง status_label ครั้งแรก ให้แสดงข้อความว่า DISCONNECTED
-            font=("Arial", 12, "bold")
+            frame,
+            textvariable=self.status_var,
+            style="Disconnected.TLabel",
         )
-        self.status_label.pack()
+        self.status_label.grid(row=0, column=6, padx=5)
 
-        connection_frame = ttk.LabelFrame(
-            main_frame,
-            text="Connection Controls",
-            padding=15
+    def _create_command_section(self):
+        frame = ttk.LabelFrame(self.root, text="2. SCPI Command")
+        frame.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text="Command:").grid(row=0, column=0, padx=5, pady=5)
+        entry = ttk.Entry(frame, textvariable=self.command_var)
+        entry.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        entry.bind("<Return>", lambda _event: self.send_command())
+        self.send_button = ttk.Button(
+            frame,
+            text="Send",
+            command=self.send_command,
+            state="disabled",
         )
-        connection_frame.pack(fill="x", pady=(0, 15))
-
-        self.connect_button = ttk.Button(   # ปุ่มนี้เรียกฟังก์ชัน connect_scope() ใน RigolGUI (คลาสหน้าต่างโปรแกรม) ก่อน จากนั้น connect_scope() จึงเรียก connect() ใน ScopeController อีกที
-            connection_frame,
-            text="Connect",
-            command=self.connect_scope
+        self.send_button.grid(row=0, column=2, padx=3)
+        self.connected_widgets.append((self.send_button, "normal"))
+        ttk.Button(frame, text="Clear Response", command=self.clear_response).grid(
+            row=0, column=3, padx=5
         )
-        self.connect_button.pack(side="left", expand=True, padx=5)  # นำปุ่ม Connect ไปแสดงในกรอบ วางเรียงจากทางซ้าย ให้ปุ่มได้รับส่วนแบ่งของพื้นที่ว่าง และเว้นระยะซ้าย–ขวา 5 พิกเซล
-
-        self.disconnect_button = ttk.Button(
-            connection_frame,
-            text="Disconnect",
-            command=self.disconnect_scope
+        ttk.Label(frame, text="Response:").grid(
+            row=1, column=0, sticky="nw", padx=5, pady=(0, 5)
         )
-        self.disconnect_button.pack(side="left", expand=True, padx=5)
-
-        control_frame = ttk.LabelFrame(
-            main_frame,
-            text="Oscilloscope Controls",
-            padding=15
+        self.response_text = tk.Text(frame, height=3, wrap="word")
+        response_scrollbar = ttk.Scrollbar(frame, command=self.response_text.yview)
+        self.response_text.configure(yscrollcommand=response_scrollbar.set)
+        self.response_text.grid(
+            row=1,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            padx=(5, 0),
+            pady=(0, 5),
         )
-        control_frame.pack(fill="x")
-
-        self.run_button = ttk.Button(
-            control_frame,
-            text="Run",
-            command=self.run_scope
+        response_scrollbar.grid(
+            row=1,
+            column=3,
+            sticky="ns",
+            padx=(0, 5),
+            pady=(0, 5),
         )
-        self.run_button.pack(side="left", expand=True, padx=5)
-        
-#    ผู้ใช้กดปุ่ม Run
-#        ↓
-# RigolGUI.run_scope()
-#        ↓
-# ScopeController.run_scope()
-#        ↓
-# ตรวจสอบว่าเชื่อมต่อเครื่องแล้วหรือยัง
-#        ↓
-# ส่งคำสั่ง :RUN ผ่าน PyVISA และ USB
-#        ↓
-# ออสซิลโลสโคปเริ่มรับและอัปเดตรูปคลื่น
-#        ↓
-# GUI แสดงข้อความว่าส่งคำสั่งสำเร็จ
 
-        self.stop_button = ttk.Button(
-            control_frame,
-            text="Stop",
-            command=self.stop_scope
+    def _create_scope_controls(self, parent):
+        frame = ttk.LabelFrame(parent, text="3. Scope Controls")
+        frame.pack(fill="x", pady=(0, 3))
+        buttons = (
+            ("Run", self.run_scope, "Run.TButton"),
+            ("Stop", self.stop_scope, "Stop.TButton"),
+            ("Single", self.single_scope, None),
+            ("Auto Set", self.auto_set, None),
         )
-        self.stop_button.pack(side="left", expand=True, padx=5)
+        for index, (text, command, style_name) in enumerate(buttons):
+            row, column = divmod(index, 2)
+            button = ttk.Button(
+                frame,
+                text=text,
+                command=command,
+                state="disabled",
+                style=style_name or "TButton",
+            )
+            button.grid(
+                row=row,
+                column=column,
+                sticky="ew",
+                padx=4,
+                pady=2,
+            )
+            if text == "Run":
+                self.run_button = button
+            elif text == "Stop":
+                self.stop_button = button
+            self.connected_widgets.append((button, "normal"))
+        frame.columnconfigure((0, 1), weight=1)
 
-    def update_connection_status(self, connected):
-        """Update the connection status and button states."""
+    def _create_channel_controls(self, parent):
+        frame = ttk.LabelFrame(parent, text="4. Channels")
+        frame.pack(fill="x", pady=3)
+        ttk.Label(frame, text="Display").grid(row=0, column=0, padx=4)
+        ttk.Label(frame, text="V/div").grid(row=0, column=1, padx=4)
+        for row, channel in enumerate(self.CHANNEL_COLORS, start=1):
+            check = ttk.Checkbutton(
+                frame,
+                text=channel,
+                style=f"{channel}.TCheckbutton",
+                variable=self.channel_vars[channel]["display"],
+                command=lambda ch=channel: self.apply_channel(ch),
+            )
+            check.grid(row=row, column=0, sticky="w", padx=4, pady=2)
+            check.configure(state="disabled")
+            self.connected_widgets.append((check, "normal"))
+            combo = ttk.Combobox(
+                frame,
+                textvariable=self.channel_vars[channel]["scale"],
+                values=list(self.VOLTAGE_SCALES),
+                state="readonly",
+                width=12,
+            )
+            combo.grid(row=row, column=1, padx=4, pady=2)
+            combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _event, ch=channel: self.apply_channel(ch),
+            )
+            combo.configure(state="disabled")
+            self.connected_widgets.append((combo, "readonly"))
 
-        if connected:
-            self.status_label.config(text="CONNECTED")
-            self.connect_button.config(state="disabled")    # connected แล้ว disable ปุ่ม connect เพราะทำ connect อยู่ ห้ามกดซ้ำ
-            self.disconnect_button.config(state="normal")
-            self.run_button.config(state="normal")
-            self.stop_button.config(state="normal")
-            # state="normal" หมายถึง เปิดให้กดปุ่มได้ตามปกติ
+    def _create_horizontal_controls(self, parent):
+        frame = ttk.LabelFrame(parent, text="5. Horizontal")
+        frame.pack(fill="x", pady=3)
+        ttk.Label(frame, text="T/div:").pack(anchor="w", padx=5, pady=(2, 0))
+        combo = ttk.Combobox(
+            frame,
+            textvariable=self.time_scale_var,
+            values=list(self.TIME_SCALES),
+            state="readonly",
+        )
+        combo.pack(fill="x", padx=5, pady=3)
+        combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_time_scale())
+        combo.configure(state="disabled")
+        self.connected_widgets.append((combo, "readonly"))
+
+    def _create_export_controls(self, parent):
+        frame = ttk.LabelFrame(parent, text="7. Export")
+        frame.pack(fill="x", pady=3)
+        items = (
+            ("Save Graph", "save_graph_button", self.save_graph, False),
+            ("Save Scope PNG", "save_scope_button", self.save_scope_png, True),
+            ("Save Waveform CSV", "save_csv_button", self.save_csv, False),
+        )
+        for text, attribute, command, enable_on_connect in items:
+            button = ttk.Button(frame, text=text, command=command, state="disabled")
+            button.pack(fill="x", padx=5, pady=2)
+            setattr(self, attribute, button)
+            if enable_on_connect:
+                self.connected_widgets.append((button, "normal"))
+
+    def _create_waveform_section(self, parent):
+        frame = ttk.LabelFrame(parent, text="6. Waveform")
+        frame.grid(row=0, column=1, sticky="nsew")
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill="x", padx=5, pady=(3, 0))
+        self.update_graph_button = ttk.Button(
+            toolbar,
+            text="Update Graph",
+            command=self.refresh_waveforms,
+            state="disabled",
+        )
+        self.update_graph_button.pack(side="right")
+        self.connected_widgets.append((self.update_graph_button, "normal"))
+        self.figure = Figure(figsize=(8, 5), dpi=100)
+        self.axes = self.figure.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.figure, frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _create_log_section(self):
+        frame = ttk.LabelFrame(self.root, text="8. Activity / Error Log")
+        frame.grid(row=3, column=0, sticky="ew", padx=8, pady=4)
+        self.log_text = tk.Text(frame, height=4, wrap="word")
+        scrollbar = ttk.Scrollbar(frame, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.log_text.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        scrollbar.pack(side="right", fill="y", padx=(0, 4), pady=4)
+
+    def _create_status_bar(self):
+        self.instrument_label = ttk.Label(
+            self.root,
+            text="Instrument: Not connected",
+        )
+        self.instrument_label.grid(row=4, column=0, sticky="w", padx=9, pady=(0, 5))
+
+    def _style_graph(self, title=""):
+        self.axes.clear()
+        self.axes.set_facecolor("#101316")
+        self.figure.patch.set_facecolor("#101316")
+        # Keep the 12 x 8 scope grid, with a small margin so traces remain visible.
+        self.axes.set_xlim(-6.15, 6.15)
+        self.axes.set_ylim(-4.2, 4.2)
+        self.axes.xaxis.set_major_locator(MultipleLocator(1))
+        self.axes.yaxis.set_major_locator(MultipleLocator(1))
+        self.axes.grid(True, color="#4d565f", alpha=0.7)
+        self.axes.axvline(0, color="#d27a22", linestyle="--", linewidth=0.8)
+        self.axes.tick_params(colors="#d7dde3")
+        for spine in self.axes.spines.values():
+            spine.set_color("#89929b")
+        self.axes.set_title(title, color="#d7dde3", fontsize=11)
+        self.axes.set_xlabel("Horizontal divisions", color="#d7dde3")
+        self.axes.set_ylabel("Vertical divisions", color="#d7dde3")
+        if hasattr(self, "canvas"):
+            self.canvas.draw_idle()
+
+    @staticmethod
+    def closest_label(options, value):
+        return min(options, key=lambda label: abs(options[label] - value))
+
+    def log(self, message):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert("end", f"[{stamp}] {message}\n")
+        self.log_text.see("end")
+
+    def show_error(self, title, error, popup=True):
+        self.log(f"{title}: {error}")
+        if popup:
+            messagebox.showerror(title, str(error))
+
+    def clear_response(self):
+        self.response_text.delete("1.0", "end")
+
+    def selected_channels(self):
+        return [
+            channel
+            for channel, settings in self.channel_vars.items()
+            if settings["display"].get()
+        ]
+
+    def update_connection_controls(self, connected):
+        """Enable instrument controls only while a scope is connected."""
+        for widget, enabled_state in self.connected_widgets:
+            widget.configure(state=enabled_state if connected else "disabled")
+
+        self.status_var.set("CONNECTED" if connected else "DISCONNECTED")
+        self.status_label.configure(
+            style="Connected.TLabel" if connected else "Disconnected.TLabel"
+        )
+        self.search_button.configure(state="disabled" if connected else "normal")
+        self.disconnect_button.configure(state="normal" if connected else "disabled")
+        self.device_box.configure(state="disabled" if connected else "readonly")
+        self.connect_button.configure(
+            state=(
+                "disabled"
+                if connected or not self.device_var.get()
+                else "normal"
+            )
+        )
+
+    def update_run_stop_buttons(self, running):
+        """Disable the command that already matches the scope state."""
+        if self.controller.scope is None:
+            self.run_button.configure(state="disabled")
+            self.stop_button.configure(state="disabled")
+        elif running:
+            self.run_button.configure(state="disabled")
+            self.stop_button.configure(state="normal")
         else:
-            self.status_label.config(text="DISCONNECTED")
-            self.connect_button.config(state="normal")
-            self.disconnect_button.config(state="disabled")
-            self.run_button.config(state="disabled")
-            self.stop_button.config(state="disabled")
-            # state="disabled" หมายถึง ปุ่มถูกปิดใช้งานและกดไม่ได้
+            self.run_button.configure(state="normal")
+            self.stop_button.configure(state="disabled")
+
+    def sync_run_stop_buttons(self):
+        status = self.controller.trigger_status()
+        self.update_run_stop_buttons(status != "STOP")
+
+    def search_devices(self, show_error=True):
+        try:
+            resources = self.controller.search()
+            self.device_box["values"] = resources
+            if resources:
+                self.device_var.set(resources[0])
+                self.connect_button.configure(state="normal")
+                self.log(f"Found {len(resources)} VISA device(s).")
+            else:
+                self.device_var.set("")
+                self.connect_button.configure(state="disabled")
+                self.log("No VISA devices found. Connect the scope, then select Search.")
+        except Exception as error:
+            self.device_box["values"] = ()
+            self.device_var.set("")
+            self.connect_button.configure(state="disabled")
+            self.show_error("Search Error", error, popup=show_error)
 
     def connect_scope(self):
-        """Handle the Connect button."""
-
-        # ให้ลองทำคำสั่งภายในก่อน หากเกิดข้อผิดพลาด ให้ไปทำส่วน except
         try:
-            resource = self.controller.connect()
-            self.update_connection_status(True)
-
+            identity = self.controller.connect(self.device_var.get())
+            self.instrument_label.configure(text=f"Instrument: {identity}")
+            self.update_connection_controls(True)
+            self.log(f"Connected: {identity}")
+            self.sync_settings()
+            self.sync_run_stop_buttons()
             messagebox.showinfo(
                 "Connection Successful",
-                f"Connected to:\n{resource}"
+                f"Connected to:\n{self.device_var.get()}\n\n{identity}",
             )
-
         except Exception as error:
-            self.update_connection_status(False)
-
-            messagebox.showerror(
-                "Connection Error",
-                str(error)
-            )
-# การใช้ try-except ช่วยให้โปรแกรมไม่ปิดตัวเองเมื่อเกิดปัญหา แต่แสดงกล่องข้อความแจ้งผู้ใช้แทน
+            self.controller.disconnect()
+            self.instrument_label.configure(text="Instrument: Not connected")
+            self.update_connection_controls(False)
+            self.show_error("Connection Error", error)
 
     def disconnect_scope(self):
-        """Handle the Disconnect button."""
-
-        try:
-            self.controller.disconnect()
-            self.update_connection_status(False)
-
+        was_connected = self.controller.scope is not None
+        self.controller.disconnect()
+        self.instrument_label.configure(text="Instrument: Not connected")
+        self.update_connection_controls(False)
+        self.log("Disconnected.")
+        if was_connected:
             messagebox.showinfo(
                 "Disconnected",
-                "The oscilloscope has been disconnected."
+                "The oscilloscope has been disconnected.",
             )
 
+    def send_command(self):
+        command = self.command_var.get().strip()
+        if not command:
+            messagebox.showwarning("Empty Command", "Please enter a SCPI command.")
+            return
+        try:
+            self.response_text.insert("end", f"> {command}\n")
+            if "?" in command:
+                response = self.controller.query(command)
+                self.response_text.insert(
+                    "end", f"< {response or '[empty response]'}\n"
+                )
+                self.log("SCPI query completed.")
+            else:
+                self.controller.write(command)
+                self.response_text.insert(
+                    "end", "Command sent - no response expected.\n"
+                )
+                action = command.upper().lstrip(":").split()[0]
+                if action == "RUN":
+                    self.update_run_stop_buttons(True)
+                elif action == "STOP":
+                    self.update_run_stop_buttons(False)
+                elif action.startswith("SING"):
+                    self.update_run_stop_buttons(True)
+                self.log("SCPI command completed.")
+            self.response_text.see("end-1c")
         except Exception as error:
-            messagebox.showerror(
-                "Disconnection Error",
-                str(error)
-            )
+            self.show_error("SCPI Error", error)
 
     def run_scope(self):
-        """Handle the Run button."""
-
         try:
-            self.controller.run_scope()
-
-            messagebox.showinfo(
-                "Command Sent",
-                "The :RUN command was sent successfully."
-            )
-
+            self.controller.run()
+            self.update_run_stop_buttons(True)
+            self.log("Scope running.")
         except Exception as error:
-            messagebox.showerror(
-                "Run Error",
-                str(error)
-            )
+            self.show_error("Run Error", error)
 
     def stop_scope(self):
-        """Handle the Stop button."""
-
         try:
-            self.controller.stop_scope()
-
-            messagebox.showinfo(
-                "Command Sent",
-                "The :STOP command was sent successfully."
-            )
-
+            self.controller.stop()
+            self.update_run_stop_buttons(False)
+            self.log("Scope stopped.")
         except Exception as error:
-            messagebox.showerror(
-                "Stop Error",
-                str(error)
+            self.show_error("Stop Error", error)
+
+    def single_scope(self):
+        try:
+            self.controller.single()
+            self.update_run_stop_buttons(True)
+            self.single_poll_count = 0
+            self.log("Single acquisition armed; waiting for a trigger...")
+            self.root.after(250, self._wait_for_single)
+        except Exception as error:
+            self.show_error("Single Error", error)
+
+    def _wait_for_single(self):
+        if self.controller.scope is None:
+            return
+        try:
+            status = self.controller.trigger_status()
+            self.single_poll_count += 1
+            if status == "STOP":
+                self.update_run_stop_buttons(False)
+                self.log("Single acquisition completed; scope stopped.")
+                self.root.after(300, self.refresh_waveforms)
+            elif self.single_poll_count < 40:
+                self.root.after(250, self._wait_for_single)
+            else:
+                self.log("Still waiting for a trigger; the existing graph was kept.")
+        except Exception as error:
+            self.show_error("Single Status Error", error, popup=False)
+
+    def auto_set(self):
+        try:
+            self.controller.auto_set()
+            self.update_run_stop_buttons(True)
+            self.log("Auto Set started...")
+            self.root.after(2500, self._finish_auto_set)
+        except Exception as error:
+            self.show_error("Auto Set Error", error)
+
+    def _finish_auto_set(self):
+        if self.controller.scope is None:
+            return
+        try:
+            self.sync_settings()
+            self.sync_run_stop_buttons()
+            self.log("Auto Set completed; settings synchronized.")
+            self.refresh_waveforms()
+        except Exception as error:
+            self.show_error("Auto Set Sync Error", error)
+
+    def sync_settings(self):
+        for channel, settings in self.channel_vars.items():
+            displayed = self.controller.get_channel_display(channel)
+            scale = self.controller.get_channel_scale(channel)
+            settings["display"].set(displayed)
+            settings["scale"].set(self.closest_label(self.VOLTAGE_SCALES, scale))
+        time_scale = self.controller.get_time_scale()
+        self.time_scale_var.set(self.closest_label(self.TIME_SCALES, time_scale))
+
+    def apply_channel(self, channel):
+        settings = self.channel_vars[channel]
+        displayed = settings["display"].get()
+        try:
+            self.controller.set_channel_display(channel, displayed)
+            if displayed:
+                scale = self.VOLTAGE_SCALES[settings["scale"].get()]
+                self.controller.set_channel_scale(channel, scale)
+                applied_scale = self.controller.get_channel_scale(channel)
+                settings["scale"].set(
+                    self.closest_label(self.VOLTAGE_SCALES, applied_scale)
+                )
+            self.schedule_refresh()
+            self.log(f"{channel} {'enabled' if displayed else 'disabled'}.")
+        except Exception as error:
+            self.show_error(f"{channel} Error", error)
+
+    def apply_time_scale(self):
+        try:
+            scale = self.TIME_SCALES[self.time_scale_var.get()]
+            self.controller.set_time_scale(scale)
+            applied = self.controller.get_time_scale()
+            self.time_scale_var.set(self.closest_label(self.TIME_SCALES, applied))
+            self.log(f"T/div set to {self.time_scale_var.get()}.")
+            # Slow sweeps need more time before screen waveform data is ready.
+            settle_ms = min(5000, max(500, int(applied * 12 * 1000) + 300))
+            self.schedule_refresh(settle_ms)
+        except Exception as error:
+            self.show_error("T/div Error", error)
+
+    def schedule_refresh(self, delay=350):
+        if self.refresh_job is not None:
+            self.root.after_cancel(self.refresh_job)
+        self.refresh_job = self.root.after(delay, self._scheduled_refresh)
+
+    def _scheduled_refresh(self):
+        self.refresh_job = None
+        self.refresh_waveforms()
+
+    def refresh_waveforms(self):
+        channels = self.selected_channels()
+        if not channels:
+            self.waveform_data = {}
+            self._style_graph("No channels selected")
+            self.save_graph_button.configure(state="disabled")
+            self.save_csv_button.configure(state="disabled")
+            self.log("Graph cleared; no channels enabled.")
+            return
+        try:
+            acquired = {}
+            errors = {}
+            self.log("Reading waveform data...")
+            for channel in channels:
+                try:
+                    acquired[channel] = self.controller.acquire_waveform(channel)
+                    self.log(f"{channel}: {acquired[channel]['points']} points received.")
+                except Exception as error:
+                    errors[channel] = error
+                    self.log(f"{channel} waveform error: {error}")
+            if not acquired:
+                details = "; ".join(f"{ch}: {error}" for ch, error in errors.items())
+                raise RuntimeError("No channel returned waveform data. " + details)
+
+            self.waveform_data = acquired
+            self._style_graph("RIGOL Waveform Display")
+            seconds_per_div = self.controller.get_time_scale()
+            for channel, waveform in acquired.items():
+                scale = self.controller.get_channel_scale(channel)
+                x_divisions = waveform["time"] / seconds_per_div
+                # The raw sample position and preamble reference reproduce the
+                # trace position seen on the scope without writing CH offset.
+                y_divisions = waveform["display_voltage"] / scale
+                self.axes.plot(
+                    x_divisions,
+                    y_divisions,
+                    color=self.CHANNEL_COLORS[channel],
+                    linewidth=1.3,
+                    label=f"{channel}  {self.channel_vars[channel]['scale'].get()}",
+                )
+
+            legend = self.axes.legend(
+                loc="upper left", facecolor="#181b1e", edgecolor="#666d72"
             )
+            for text in legend.get_texts():
+                text.set_color("white")
+            self.figure.tight_layout()
+            self.canvas.draw_idle()
+            self.save_graph_button.configure(state="normal")
+            self.save_csv_button.configure(state="normal")
+            self.log("Graph updated.")
+            if errors:
+                self.log("Graph kept available channels; failed: " + ", ".join(errors))
+        except Exception as error:
+            self.show_error("Waveform Error", error)
 
-    def close_application(self):
-        """Disconnect safely before closing the application."""
+    def _default_filename(self, prefix, extension):
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{prefix}_{stamp}.{extension}"
 
-        self.controller.disconnect()
-        self.root.destroy()
+    def save_graph(self):
+        if not self.waveform_data:
+            messagebox.showwarning("No Graph", "Update the graph before saving.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Waveform Graph",
+            defaultextension=".png",
+            initialfile=self._default_filename("rigol_graph", "png"),
+            filetypes=[("PNG image", "*.png")],
+        )
+        if not path:
+            return
+        try:
+            self.figure.savefig(
+                path, dpi=200, bbox_inches="tight", facecolor=self.figure.get_facecolor()
+            )
+            self.log(f"Graph saved: {path}")
+        except OSError as error:
+            self.show_error("Save Graph Error", error)
+
+    def save_scope_png(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Oscilloscope Screen",
+            defaultextension=".png",
+            initialfile=self._default_filename("rigol_scope", "png"),
+            filetypes=[("PNG image", "*.png")],
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_bytes(self.controller.capture_screenshot())
+            self.log(f"Scope screen saved: {path}")
+        except Exception as error:
+            self.show_error("Screenshot Error", error)
+
+    def save_csv(self):
+        if not self.waveform_data:
+            messagebox.showwarning("No Waveform", "Update the graph before saving CSV.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Waveform Data",
+            defaultextension=".csv",
+            initialfile=self._default_filename("rigol_waveform", "csv"),
+            filetypes=[("CSV file", "*.csv")],
+        )
+        if not path:
+            return
+        try:
+            channels = list(self.waveform_data)
+            row_count = min(data["points"] for data in self.waveform_data.values())
+            with Path(path).open("w", newline="", encoding="utf-8-sig") as csv_file:
+                writer = csv.writer(csv_file)
+                header = ["Sample"]
+                for channel in channels:
+                    header.extend([f"{channel}_Time_s", f"{channel}_Voltage_V"])
+                writer.writerow(header)
+                for index in range(row_count):
+                    row = [index]
+                    for channel in channels:
+                        waveform = self.waveform_data[channel]
+                        row.extend([waveform["time"][index], waveform["voltage"][index]])
+                    writer.writerow(row)
+            self.log(f"Waveform CSV saved: {path}")
+        except OSError as error:
+            self.show_error("Save CSV Error", error)
+
+    def close(self):
+        try:
+            self.controller.disconnect()
+        finally:
+            self.root.destroy()
 
 
 def main():
     root = tk.Tk()
-    RigolGUI(root)
+    RigolApp(root)
     root.mainloop()
 
 
