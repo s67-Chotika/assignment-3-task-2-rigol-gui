@@ -19,6 +19,7 @@ class ScopeController:
     CHANNELS = {f"CH{number}": f"CHANnel{number}" for number in range(1, 5)}
 
     def __init__(self, backend="@py", timeout=5000):
+        """Initialize VISA configuration and the disconnected instrument state."""
         self.backend = backend
         self.timeout = timeout
         self.resource_manager = None
@@ -26,11 +27,14 @@ class ScopeController:
         self.resource_name = None
         self.instrument_id = None
 
+    # VISA discovery and connection management
     def _create_resource_manager(self):
+        """Create the VISA resource manager only when it is first needed."""
         if self.resource_manager is None:
             self.resource_manager = pyvisa.ResourceManager(self.backend)
 
     def search(self):
+        """Return the USB VISA resource names detected by PyVISA."""
         self._create_resource_manager()
         return [
             resource
@@ -39,6 +43,7 @@ class ScopeController:
         ]
 
     def connect(self, resource_name):
+        """Open the selected VISA resource and return its identity string."""
         if not resource_name:
             raise RuntimeError("Please select a VISA device first.")
         if self.scope is not None:
@@ -60,6 +65,7 @@ class ScopeController:
             raise
 
     def disconnect(self):
+        """Close the instrument and resource manager safely."""
         if self.scope is not None:
             try:
                 self.scope.close()
@@ -74,61 +80,74 @@ class ScopeController:
         self.instrument_id = None
 
     def ensure_connected(self):
+        """Raise an error when an operation is requested while disconnected."""
         if self.scope is None:
             raise RuntimeError("The oscilloscope is not connected.")
 
+    # Generic SCPI input and output helpers
     def write(self, command):
+        """Send a write-only SCPI command to the oscilloscope."""
         self.ensure_connected()
         self.scope.write(command)
 
     def query(self, command):
+        """Send a SCPI query and return the stripped instrument response."""
         self.ensure_connected()
         return self.scope.query(command).strip()
 
     def query_float(self, command):
+        """Send a SCPI query and convert its response to a float."""
         return float(self.query(command))
 
     @classmethod
     def source(cls, channel):
+        """Convert a GUI channel label into its RIGOL SCPI source name."""
         try:
             return cls.CHANNELS[channel]
         except KeyError as error:
             raise ValueError(f"Invalid channel: {channel}") from error
 
-    def run(self):
+    # Acquisition, channel, and timebase controls
+    def run(self):  # Start continuous waveform acquisition.
         self.write(":RUN")
-    def stop(self):
+    def stop(self):  # Stop waveform acquisition.
         self.write(":STOP")
-    def single(self):
+    def single(self):  # Arm one triggered acquisition.
         self.write(":SINGle")
 
     def auto_set(self):
+        """Run the RIGOL autoscale sequence used by MSO/DS1000Z models."""
         # MSO/DS1000Z uses AUToscale, not AUToset.
         self.write(":SYSTem:AUToscale ON")
         self.write(":AUToscale")
 
     def trigger_status(self):
+        """Return the current oscilloscope trigger state."""
         return self.query(":TRIGger:STATus?").upper()
 
     def set_channel_display(self, channel, displayed):
+        """Enable or disable the selected channel display."""
         state = "ON" if displayed else "OFF"
         self.write(f":{self.source(channel)}:DISPlay {state}")
 
     def set_channel_scale(self, channel, volts_per_div):
+        """Set the vertical volts-per-division value for one channel."""
         self.write(f":{self.source(channel)}:SCALe {volts_per_div}")
 
-    def get_channel_display(self, channel):
+    def get_channel_display(self, channel):  # Read a channel's display state.
         return bool(int(float(self.query(f":{self.source(channel)}:DISPlay?"))))
 
-    def get_channel_scale(self, channel):
+    def get_channel_scale(self, channel):  # Read a channel's V/div setting.
         return self.query_float(f":{self.source(channel)}:SCALe?")
 
     def set_time_scale(self, seconds_per_div):
+        """Set the horizontal seconds-per-division value."""
         self.write(f":TIMebase:MAIN:SCALe {seconds_per_div}")
 
-    def get_time_scale(self):
+    def get_time_scale(self):  # Read the horizontal T/div setting.
         return self.query_float(":TIMebase:MAIN:SCALe?")
 
+    # Binary waveform and screenshot transfers
     def _query_binary_block(self, command, timeout=30000, minimum_size=0):
         """Read a definite-length IEEE block reliably through pyvisa-py."""
         self.ensure_connected()
@@ -194,6 +213,7 @@ class ScopeController:
             self.scope.read_termination = old_read_termination
 
     def acquire_waveform(self, channel):
+        """Read and convert waveform samples for one enabled channel."""
         source = self.source(channel)
         self.write(f":WAVeform:SOURce {source}")
         self.write(":WAVeform:MODE NORMal")
@@ -231,6 +251,7 @@ class ScopeController:
         }
 
     def capture_screenshot(self):
+        """Request and validate a PNG screenshot from the oscilloscope."""
         command = ":DISPlay:DATA? ON,OFF,PNG"
         data = self._query_binary_block(command, timeout=30000)
         if not data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -263,6 +284,7 @@ class RigolApp:
     }
 
     def __init__(self, root, controller=None):
+        """Initialize application state, styles, variables, and widgets."""
         self.root = root
         self.controller = controller or ScopeController()
         self.waveform_data = {}
@@ -304,7 +326,9 @@ class RigolApp:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.search_devices(show_error=False)
 
+    # Window layout and widget construction
     def _configure_window(self):
+        """Set the window title, size limits, and responsive grid weights."""
         self.root.title("RIGOL Oscilloscope Capture Companion")
         self.root.geometry("1200x760")
         self.root.minsize(900, 620)
@@ -312,6 +336,7 @@ class RigolApp:
         self.root.rowconfigure(2, weight=1)
 
     def _create_widgets(self):
+        """Build and arrange all major sections of the application window."""
         self._create_instrument_section()
         self._create_command_section()
 
@@ -331,6 +356,7 @@ class RigolApp:
         self._create_status_bar()
 
     def _create_instrument_section(self):
+        """Create device selection, connection buttons, and status display."""
         frame = ttk.LabelFrame(self.root, text="1. Instrument")
         frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
         frame.columnconfigure(1, weight=1)
@@ -357,6 +383,7 @@ class RigolApp:
         self.status_label.grid(row=0, column=6, padx=5)
 
     def _create_command_section(self):
+        """Create the SCPI command entry and scrollable response display."""
         frame = ttk.LabelFrame(self.root, text="2. SCPI Command")
         frame.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
         frame.columnconfigure(1, weight=1)
@@ -398,6 +425,7 @@ class RigolApp:
         )
 
     def _create_scope_controls(self, parent):
+        """Create Run, Stop, Single, and Auto Set controls."""
         frame = ttk.LabelFrame(parent, text="3. Scope Controls")
         frame.pack(fill="x", pady=(0, 3))
         buttons = (
@@ -430,6 +458,7 @@ class RigolApp:
         frame.columnconfigure((0, 1), weight=1)
 
     def _create_channel_controls(self, parent):
+        """Create display and V/div controls for channels CH1 through CH4."""
         frame = ttk.LabelFrame(parent, text="4. Channels")
         frame.pack(fill="x", pady=3)
         ttk.Label(frame, text="Display").grid(row=0, column=0, padx=4)
@@ -461,6 +490,7 @@ class RigolApp:
             self.connected_widgets.append((combo, "readonly"))
 
     def _create_horizontal_controls(self, parent):
+        """Create the horizontal time-per-division control."""
         frame = ttk.LabelFrame(parent, text="5. Horizontal")
         frame.pack(fill="x", pady=3)
         ttk.Label(frame, text="T/div:").pack(anchor="w", padx=5, pady=(2, 0))
@@ -476,6 +506,7 @@ class RigolApp:
         self.connected_widgets.append((combo, "readonly"))
 
     def _create_export_controls(self, parent):
+        """Create controls for graph, scope-screen, and CSV exports."""
         frame = ttk.LabelFrame(parent, text="7. Export")
         frame.pack(fill="x", pady=3)
         items = (
@@ -491,6 +522,7 @@ class RigolApp:
                 self.connected_widgets.append((button, "normal"))
 
     def _create_waveform_section(self, parent):
+        """Create the Matplotlib waveform canvas and update button."""
         frame = ttk.LabelFrame(parent, text="6. Waveform")
         frame.grid(row=0, column=1, sticky="nsew")
         toolbar = ttk.Frame(frame)
@@ -509,6 +541,7 @@ class RigolApp:
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def _create_log_section(self):
+        """Create the scrollable activity and error log."""
         frame = ttk.LabelFrame(self.root, text="8. Activity / Error Log")
         frame.grid(row=3, column=0, sticky="ew", padx=8, pady=4)
         self.log_text = tk.Text(frame, height=4, wrap="word")
@@ -518,6 +551,7 @@ class RigolApp:
         scrollbar.pack(side="right", fill="y", padx=(0, 4), pady=4)
 
     def _create_status_bar(self):
+        """Create the status bar that displays the connected instrument ID."""
         self.instrument_label = ttk.Label(
             self.root,
             text="Instrument: Not connected",
@@ -525,6 +559,7 @@ class RigolApp:
         self.instrument_label.grid(row=4, column=0, sticky="w", padx=9, pady=(0, 5))
 
     def _style_graph(self, title=""):
+        """Clear and style the graph as a 12-by-8 oscilloscope grid."""
         self.axes.clear()
         self.axes.set_facecolor("#101316")
         self.figure.patch.set_facecolor("#101316")
@@ -546,22 +581,26 @@ class RigolApp:
 
     @staticmethod
     def closest_label(options, value):
+        """Return the UI scale label whose numeric value is the closest match."""
         return min(options, key=lambda label: abs(options[label] - value))
 
+    # Logging, errors, and GUI state helpers
     def log(self, message):
+        """Append a timestamped activity message to the system log."""
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.insert("end", f"[{stamp}] {message}\n")
         self.log_text.see("end")
 
     def show_error(self, title, error, popup=True):
+        """Record an error and optionally show it in a message box."""
         self.log(f"{title}: {error}")
         if popup:
             messagebox.showerror(title, str(error))
 
-    def clear_response(self):
+    def clear_response(self):  # Clear displayed responses without undoing commands.
         self.response_text.delete("1.0", "end")
 
-    def selected_channels(self):
+    def selected_channels(self):  # Return the channels enabled in the GUI.
         return [
             channel
             for channel, settings in self.channel_vars.items()
@@ -601,10 +640,13 @@ class RigolApp:
             self.stop_button.configure(state="disabled")
 
     def sync_run_stop_buttons(self):
+        """Query trigger status and synchronize the Run/Stop button states."""
         status = self.controller.trigger_status()
         self.update_run_stop_buttons(status != "STOP")
 
+    # Connection and instrument event callbacks
     def search_devices(self, show_error=True):
+        """Scan for USB VISA instruments and populate the device list."""
         try:
             resources = self.controller.search()
             self.device_box["values"] = resources
@@ -623,6 +665,7 @@ class RigolApp:
             self.show_error("Search Error", error, popup=show_error)
 
     def connect_scope(self):
+        """Connect to the selected device and synchronize its current settings."""
         try:
             identity = self.controller.connect(self.device_var.get())
             self.instrument_label.configure(text=f"Instrument: {identity}")
@@ -641,6 +684,7 @@ class RigolApp:
             self.show_error("Connection Error", error)
 
     def disconnect_scope(self):
+        """Disconnect cleanly and return all controls to their initial state."""
         was_connected = self.controller.scope is not None
         self.controller.disconnect()
         self.instrument_label.configure(text="Instrument: Not connected")
@@ -653,6 +697,7 @@ class RigolApp:
             )
 
     def send_command(self):
+        """Execute the manually entered SCPI command or query."""
         command = self.command_var.get().strip()
         if not command:
             messagebox.showwarning("Empty Command", "Please enter a SCPI command.")
@@ -683,6 +728,7 @@ class RigolApp:
             self.show_error("SCPI Error", error)
 
     def run_scope(self):
+        """Handle the Run button and update the acquisition controls."""
         try:
             self.controller.run()
             self.update_run_stop_buttons(True)
@@ -691,6 +737,7 @@ class RigolApp:
             self.show_error("Run Error", error)
 
     def stop_scope(self):
+        """Handle the Stop button and update the acquisition controls."""
         try:
             self.controller.stop()
             self.update_run_stop_buttons(False)
@@ -699,6 +746,7 @@ class RigolApp:
             self.show_error("Stop Error", error)
 
     def single_scope(self):
+        """Arm a single acquisition and begin polling for completion."""
         try:
             self.controller.single()
             self.update_run_stop_buttons(True)
@@ -709,6 +757,7 @@ class RigolApp:
             self.show_error("Single Error", error)
 
     def _wait_for_single(self):
+        """Poll trigger status until Single completes or the wait limit is reached."""
         if self.controller.scope is None:
             return
         try:
@@ -726,6 +775,7 @@ class RigolApp:
             self.show_error("Single Status Error", error, popup=False)
 
     def auto_set(self):
+        """Start Auto Set and schedule synchronization after autoscaling."""
         try:
             self.controller.auto_set()
             self.update_run_stop_buttons(True)
@@ -735,6 +785,7 @@ class RigolApp:
             self.show_error("Auto Set Error", error)
 
     def _finish_auto_set(self):
+        """Synchronize settings and refresh the graph after Auto Set finishes."""
         if self.controller.scope is None:
             return
         try:
@@ -746,6 +797,7 @@ class RigolApp:
             self.show_error("Auto Set Sync Error", error)
 
     def sync_settings(self):
+        """Read channel and timebase settings from the physical oscilloscope."""
         for channel, settings in self.channel_vars.items():
             displayed = self.controller.get_channel_display(channel)
             scale = self.controller.get_channel_scale(channel)
@@ -755,6 +807,7 @@ class RigolApp:
         self.time_scale_var.set(self.closest_label(self.TIME_SCALES, time_scale))
 
     def apply_channel(self, channel):
+        """Apply one channel's display and V/div settings to the oscilloscope."""
         settings = self.channel_vars[channel]
         displayed = settings["display"].get()
         try:
@@ -772,6 +825,7 @@ class RigolApp:
             self.show_error(f"{channel} Error", error)
 
     def apply_time_scale(self):
+        """Apply T/div and delay refresh long enough for the sweep to settle."""
         try:
             scale = self.TIME_SCALES[self.time_scale_var.get()]
             self.controller.set_time_scale(scale)
@@ -784,16 +838,19 @@ class RigolApp:
         except Exception as error:
             self.show_error("T/div Error", error)
 
+    # Waveform refresh scheduling and drawing
     def schedule_refresh(self, delay=350):
+        """Debounce graph refreshes so rapid setting changes trigger one update."""
         if self.refresh_job is not None:
             self.root.after_cancel(self.refresh_job)
         self.refresh_job = self.root.after(delay, self._scheduled_refresh)
 
-    def _scheduled_refresh(self):
+    def _scheduled_refresh(self):  # Clear the pending job before refreshing.
         self.refresh_job = None
         self.refresh_waveforms()
 
     def refresh_waveforms(self):
+        """Acquire enabled channels and redraw the waveform display."""
         channels = self.selected_channels()
         if not channels:
             self.waveform_data = {}
@@ -849,11 +906,13 @@ class RigolApp:
         except Exception as error:
             self.show_error("Waveform Error", error)
 
-    def _default_filename(self, prefix, extension):
+    # File export helpers
+    def _default_filename(self, prefix, extension):  # Build a timestamped file name.
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"{prefix}_{stamp}.{extension}"
 
     def save_graph(self):
+        """Save the displayed Matplotlib waveform graph as a PNG file."""
         if not self.waveform_data:
             messagebox.showwarning("No Graph", "Update the graph before saving.")
             return
@@ -874,6 +933,7 @@ class RigolApp:
             self.show_error("Save Graph Error", error)
 
     def save_scope_png(self):
+        """Save a PNG screenshot returned directly by the oscilloscope."""
         path = filedialog.asksaveasfilename(
             title="Save Oscilloscope Screen",
             defaultextension=".png",
@@ -889,6 +949,7 @@ class RigolApp:
             self.show_error("Screenshot Error", error)
 
     def save_csv(self):
+        """Save calibrated time and voltage samples for all acquired channels."""
         if not self.waveform_data:
             messagebox.showwarning("No Waveform", "Update the graph before saving CSV.")
             return
@@ -920,6 +981,7 @@ class RigolApp:
             self.show_error("Save CSV Error", error)
 
     def close(self):
+        """Disconnect safely before destroying the Tkinter window."""
         try:
             self.controller.disconnect()
         finally:
@@ -927,6 +989,7 @@ class RigolApp:
 
 
 def main():
+    """Create the Tkinter application and start its event loop."""
     root = tk.Tk()
     RigolApp(root)
     root.mainloop()
